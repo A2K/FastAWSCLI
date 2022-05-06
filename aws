@@ -1,0 +1,173 @@
+#!/usr/bin/python3
+
+import os
+import io
+import sys
+import subprocess
+from multiprocessing.connection import Listener
+from multiprocessing.connection import Client
+import threading
+from time import sleep
+address = ('localhost', 6000)     # family is deduced to be 'AF_INET'
+from awscli.clidriver import CLIOperationCaller, LOG, create_clidriver, HISTORY_RECORDER
+
+PASSWORD=b'secret password'
+
+def copy_stdin(conn, source):
+    while True:
+        data = source.read(10 * 1024 * 1024)
+        if len(data) == 0:
+            break
+        conn.send_bytes(bytes(data, 'utf-8'))
+
+def run_client():
+    args = sys.argv[1:]
+
+    conn = Client(address, authkey=PASSWORD)
+    conn.send(args)
+
+    thread = threading.Thread(target=copy_stdin, args=(conn,sys.__stdin__))
+    thread.setDaemon(True)
+    thread.start()
+
+    while True:
+        res = conn.recv()
+        if 'stdout' in res:
+            sys.stdout.write(res['stdout'])
+        if 'stderr' in res:
+            sys.stdout.write(res['stderr'])
+        if "code" in res:
+            return res["code"]
+
+class Reader(io.RawIOBase):
+    def __init__(self, conn):
+        super().__init__()
+        self.conn = conn
+
+    def read(self, maxlen = -1):
+        if maxlen == -1:
+            maxlen = None
+        try:
+            return self.conn.recv_bytes(maxlen)
+        except:
+            return bytes()
+
+class Writer(io.StringIO):
+
+    def __init__(self, conn, type):
+        super().__init__()
+        self.conn = conn
+        self.type = type
+
+    def write(self, __s):
+        return self.conn.send({self.type: __s})
+
+def process_conn(driver, conn):
+    try:
+        msg = None
+        try:
+            msg = conn.recv()
+        except: return
+
+        with Writer(conn, 'stdout') as sys.stdout:
+            with Writer(conn, 'stderr') as sys.stderr:
+                with io.TextIOWrapper(Reader(conn)) as sys.stdin:
+                    try:
+                        rc = driver.main(msg)
+                    except:
+                        rc = 2
+
+                    try:
+                        conn.send({"code": rc})
+                    except: return
+                    finally:
+                        HISTORY_RECORDER.record('CLI_RC', rc, 'CLI')
+
+    except Exception as e:
+        try:
+            conn.send({"code": 1})
+        except: pass
+    finally:
+        try:
+            conn.close()
+        except: pass
+
+def run_daemon():
+
+    def patchedInit(self, session):
+            self._session = session
+            self._client = None
+
+    def patchedInvoke(self, service_name, operation_name, parameters, parsed_globals):
+        if self._client is None:
+            LOG.debug("Creating new %s client" % service_name)
+            self._client = self._session.create_client(
+                    service_name, region_name=parsed_globals.region,
+                    endpoint_url=parsed_globals.endpoint_url,
+                    verify=parsed_globals.verify_ssl)
+
+        client = self._client
+
+        response = self._make_client_call(client, operation_name, parameters, parsed_globals)
+        self._display_response(operation_name, response, parsed_globals)
+        return 0
+
+    CLIOperationCaller.__init__ = patchedInit
+    CLIOperationCaller.invoke = patchedInvoke
+
+    driver = create_clidriver()
+
+    while True:
+        try:
+            with Listener(address, authkey=PASSWORD) as listener:
+                while True:
+                    with listener.accept() as conn:
+                        process_conn(driver, conn)
+        except:
+            continue
+
+def main():
+
+    if os.environ.get("AWSR_CLIENT") == "True":
+        rc = run_client()
+        sys.exit(rc)
+    elif os.environ.get("AWSR_DAEMON") == "True":
+        try:
+            print('running daemon')
+            run_daemon()
+        finally:
+            print('daemon exited')
+            return
+
+    pid=''
+    if os.path.exists('/tmp/aws.pid'):
+        with open('/tmp/aws.pid', 'r') as f:
+            pid = f.read()
+
+    try:
+        Client(address, authkey=PASSWORD)
+    except:
+        pid=''
+
+    if len(pid):
+        run_client()
+    else:
+        with open(os.devnull, 'r+b', 0) as DEVNULL:
+            p = subprocess.Popen(sys.argv, stdin=DEVNULL, stdout=DEVNULL, stderr=DEVNULL, close_fds=True, env={
+                "AWSR_DAEMON": "True",
+                "AWS_PROFILE": os.environ.get("AWS_PROFILE", "default"),
+                })
+            with open('/tmp/aws.pid', 'w') as f:
+                f.write(str(p.pid))
+
+        while True:
+            try:
+                Client(address, authkey=PASSWORD)
+                break
+            except:
+                sleep(0.1)
+        run_client()
+
+if __name__ == "__main__":
+    main()
+
